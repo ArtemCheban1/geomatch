@@ -7,7 +7,8 @@ import type { ImageSource, StyleSpecification, MapMouseEvent } from 'maplibre-gl
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { mercToLngLat, type LngLat } from '../geo/mercator';
 import type { WarpResult } from '../geo/warp';
-import type { BasemapId, Layer, Poi, Store } from '../state';
+import type { BasemapId, Layer, Poi, PointCollection, RefLayer, Store } from '../state';
+import { featureTitle } from '../refLayers';
 
 export interface MapViewEvents {
   addPoint(ll: LngLat): void;
@@ -22,6 +23,8 @@ export interface MapViewEvents {
   exploreClick(ll: LngLat): void;
   poiSelect(id: string): void;
   poiMove(id: string, ll: LngLat): void;
+  /** "Add to my marks" pressed in a reference-point popup. */
+  refToPoi(title: string, description: string, ll: LngLat): void;
 }
 
 /** A no-op implementation, for maps that are view-only (compare map). */
@@ -36,6 +39,7 @@ export const NO_EVENTS: MapViewEvents = {
   exploreClick: () => {},
   poiSelect: () => {},
   poiMove: () => {},
+  refToPoi: () => {},
 };
 
 /**
@@ -157,6 +161,7 @@ export class MapView {
 
     this.map.on('click', (e: MapMouseEvent) => {
       const ll: LngLat = [e.lngLat.lng, e.lngLat.lat];
+      if (this.handleRefClick(e)) return;
       if (this.store.ui.view === 'explore') {
         this.events.exploreClick(ll);
       } else if (this.store.ui.mode === 'points' && this.store.activeLayer) {
@@ -421,6 +426,111 @@ export class MapView {
     window.addEventListener('mouseup', end);
   }
 
+  // ---------- reference layers (heritage databases) ----------
+
+  private refIds = new Set<string>();
+  private popup: maplibregl.Popup | null = null;
+
+  /** Show / update / hide a reference point layer. */
+  setRefLayer(l: RefLayer, data: PointCollection | null): void {
+    if (!this.loaded) {
+      void this.ready.then(() => this.setRefLayer(l, data));
+      return;
+    }
+    const id = `ref-${l.id}`;
+    const src = this.map.getSource(id) as maplibregl.GeoJSONSource | undefined;
+    if (!data) {
+      if (this.map.getLayer(id)) this.map.setLayoutProperty(id, 'visibility', 'none');
+      return;
+    }
+    if (!src) {
+      this.map.addSource(id, { type: 'geojson', data: data as any });
+      this.map.addLayer({
+        id,
+        type: 'circle',
+        source: id,
+        paint: {
+          'circle-radius': ['interpolate', ['linear'], ['zoom'], 6, 3, 10, 5, 14, 7],
+          'circle-color': l.color,
+          'circle-stroke-color': '#fff',
+          'circle-stroke-width': 1.5,
+          'circle-opacity': 0.9,
+        },
+      });
+      this.refIds.add(id);
+      this.map.on('mouseenter', id, () => {
+        if (this.refClickable()) this.map.getCanvas().style.cursor = 'pointer';
+      });
+      this.map.on('mouseleave', id, () => (this.map.getCanvas().style.cursor = ''));
+    } else if ((src as any)._refData !== data) {
+      src.setData(data as any);
+    }
+    (this.map.getSource(id) as any)._refData = data;
+    this.map.setPaintProperty(id, 'circle-color', l.color);
+    this.map.setLayoutProperty(id, 'visibility', l.visible ? 'visible' : 'none');
+  }
+
+  removeRefLayer(layerId: string): void {
+    const id = `ref-${layerId}`;
+    if (this.map.getLayer(id)) this.map.removeLayer(id);
+    if (this.map.getSource(id)) this.map.removeSource(id);
+    this.refIds.delete(id);
+  }
+
+  /** Reference points answer clicks in explore view and in the "look around" tool. */
+  private refClickable(): boolean {
+    const ui = this.store.ui;
+    return this.role === 'main' && (ui.view === 'explore' ? !ui.addingPoi : ui.mode === 'pan');
+  }
+
+  private handleRefClick(e: MapMouseEvent): boolean {
+    if (!this.refClickable() || !this.refIds.size) return false;
+    const layers = [...this.refIds].filter((id) => this.map.getLayer(id));
+    const hit = this.map.queryRenderedFeatures(
+      [
+        [e.point.x - 6, e.point.y - 6],
+        [e.point.x + 6, e.point.y + 6],
+      ],
+      { layers },
+    )[0];
+    if (!hit) return false;
+    const props = (hit.properties ?? {}) as Record<string, unknown>;
+    const coords = (hit.geometry as any).coordinates as LngLat;
+    const refLayer = this.store.project.refLayers.find((l) => `ref-${l.id}` === hit.layer.id);
+    this.showRefPopup(props, coords, refLayer);
+    return true;
+  }
+
+  private showRefPopup(props: Record<string, unknown>, ll: LngLat, layer?: RefLayer): void {
+    const title = featureTitle(props);
+    const el = document.createElement('div');
+    el.className = 'ref-popup';
+    const rows = Object.entries(props)
+      .filter(([k, v]) => v !== null && v !== '' && typeof v !== 'object' && !/^(title|name|url|link)$/i.test(k))
+      .slice(0, 14)
+      .map(([k, v]) => `<tr><th>${escHtml(k)}</th><td>${escHtml(String(v))}</td></tr>`)
+      .join('');
+    const url = [props.url, props.link].find((v) => typeof v === 'string' && /^https?:\/\//.test(v)) as string | undefined;
+    el.innerHTML = `
+      <div class="ref-popup-src" style="color:${layer?.color ?? '#495057'}">${escHtml(layer?.name ?? '')}</div>
+      <div class="ref-popup-title">${escHtml(title)}</div>
+      ${rows ? `<table>${rows}</table>` : ''}
+      <div class="ref-popup-actions">
+        ${url ? `<a href="${escHtml(url)}" target="_blank" rel="noopener">Відкрити запис ↗</a>` : '<span></span>'}
+        <button class="btn small" data-act="to-poi">📍 У мої мітки</button>
+      </div>`;
+    el.querySelector('[data-act=to-poi]')!.addEventListener('click', () => {
+      const description = Object.entries(props)
+        .filter(([k, v]) => v !== null && v !== '' && typeof v !== 'object' && !/^(title|name)$/i.test(k))
+        .map(([k, v]) => `${k}: ${v}`)
+        .join('\n');
+      this.events.refToPoi(title, `${description}${layer?.attribution ? `\n\nДжерело: ${layer.attribution}` : ''}`, ll);
+      this.popup?.remove();
+    });
+    this.popup?.remove();
+    this.popup = new maplibregl.Popup({ maxWidth: '340px', offset: 8 }).setLngLat(ll).setDOMContent(el).addTo(this.map);
+  }
+
   // ---------- points of interest ----------
 
   syncPois(): void {
@@ -492,4 +602,8 @@ export class MapView {
 
 function emptyFc(): { type: 'FeatureCollection'; features: [] } {
   return { type: 'FeatureCollection', features: [] };
+}
+
+function escHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
 }

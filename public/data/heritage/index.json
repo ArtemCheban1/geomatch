@@ -1,0 +1,16 @@
+[
+  {
+    "id": "ran-suceava",
+    "name": "RAN — jud. Suceava",
+    "color": "#c92a2a",
+    "url": "data/heritage/ran-suceava.geojson",
+    "attribution": "Repertoriul Arheologic Național (RAN), INP / cIMeC — ran.cimec.ro"
+  },
+  {
+    "id": "ran-botosani",
+    "name": "RAN — jud. Botoșani",
+    "color": "#5f3dc4",
+    "url": "data/heritage/ran-botosani.geojson",
+    "attribution": "Repertoriul Arheologic Național (RAN), INP / cIMeC — ran.cimec.ro"
+  }
+]

@@ -777,6 +777,7 @@ body.view-explore .explore-panel {
   padding: 0;
 }
 .explore-layers li,
+.ref-list li,
 .category-list li {
   display: flex;
   align-items: center;
@@ -784,6 +785,7 @@ body.view-explore .explore-panel {
   padding: 4px 2px;
 }
 .explore-layers .name,
+.ref-list .name,
 .category-list .name {
   flex: 1;
   min-width: 0;
@@ -794,6 +796,7 @@ body.view-explore .explore-panel {
 .explore-layers input[type='range'] {
   width: 70px;
 }
+.ref-list input[type='color'],
 .category-list input[type='color'] {
   width: 22px;
   height: 22px;
@@ -845,6 +848,45 @@ body.view-explore .explore-panel {
 }
 .tag {
   color: var(--accent-2);
+}
+
+/* ---------- reference point popup ---------- */
+.ref-popup {
+  font-size: 12.5px;
+  min-width: 220px;
+}
+.ref-popup-src {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.ref-popup-title {
+  font-weight: 700;
+  font-size: 14px;
+  margin: 2px 0 6px;
+}
+.ref-popup table {
+  border-collapse: collapse;
+  width: 100%;
+  margin-bottom: 8px;
+}
+.ref-popup th {
+  text-align: left;
+  color: var(--muted);
+  font-weight: 500;
+  padding: 1px 8px 1px 0;
+  vertical-align: top;
+  white-space: nowrap;
+}
+.ref-popup td {
+  padding: 1px 0;
+}
+.ref-popup-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
 }
 
 /* ---------- POI editor ---------- */

@@ -28,6 +28,7 @@ import {
   type Mode,
   type View,
 } from './state';
+import { mergeManifest } from './refLayers';
 import { Explore } from './ui/explore';
 import { ImageView } from './ui/imageView';
 import { BASEMAPS, MapView } from './ui/mapView';
@@ -385,7 +386,9 @@ async function loadIntoStore(p: ReturnType<typeof newProject>): Promise<void> {
   }
   fits.clear();
   warpResults.clear();
+  for (const r of store.project.refLayers) mapView.removeRefLayer(r.id);
   store.project = normalizeProject(p);
+  await mergeManifest(store.project);
   store.ui = { ...initialUi(), view: store.ui.view };
   store.emit('load');
   mapView.setBasemap(p.basemap);
@@ -979,12 +982,14 @@ async function boot(): Promise<void> {
     exploreClick: (ll) => explore.mapClick(ll),
     poiSelect: (id) => explore.selectPoi(id),
     poiMove: (id, ll) => explore.movePoi(id, ll),
+    refToPoi: (title, description, ll) => explore.addPoiFromRef(title, description, ll),
   });
   explore = new Explore({ store, main: mapView, warpResults, toast });
 
   store.subscribe(onChange);
   initControls();
   await mapView.whenReady();
+  await mergeManifest(store.project);
   store.emit('load');
   for (const l of store.project.layers) scheduleWarp(l, 0);
 

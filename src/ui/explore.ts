@@ -5,7 +5,8 @@
  */
 import type { LngLat } from '../geo/mercator';
 import type { WarpResult } from '../geo/warp';
-import { uid, type CompareMode, type Layer, type Poi, type Store } from '../state';
+import { uid, type CompareMode, type Layer, type Poi, type RefLayer, type Store } from '../state';
+import { loadRefData, newFileLayer, parseRefFile, refStatus } from '../refLayers';
 import { MapView, NO_EVENTS } from './mapView';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -253,8 +254,10 @@ export class Explore {
 
     this.syncCompare();
     this.main.syncPois();
+    this.syncRefLayers();
     if (!explore) return;
     this.renderLayers();
+    this.renderRefLayers();
     this.renderCategories();
     this.renderPoiList();
     this.renderEditor();
@@ -287,6 +290,89 @@ export class Explore {
       const r = li.querySelector<HTMLInputElement>('[data-act=opacity]');
       if (l && r && document.activeElement !== r) r.value = String(l.opacity);
     });
+  }
+
+  // ------------------------------------------------------------ reference layers
+
+  /** Push reference layers to the map, loading data of visible ones on demand. */
+  syncRefLayers(): void {
+    for (const l of this.store.project.refLayers) {
+      if (!l.visible) {
+        this.main.setRefLayer(l, null);
+        continue;
+      }
+      const st = refStatus(l);
+      if (l.source === 'file') {
+        this.main.setRefLayer(l, l.data ?? null);
+      } else if (st.state === 'idle') {
+        void loadRefData(l).then((data) => {
+          this.main.setRefLayer(l, data);
+          if (!data && refStatus(l).state === 'missing') {
+            this.deps.toast(`«${l.name}»: дані ще не завантажені в застосунок.`, 'error');
+          }
+          this.renderRefLayers();
+        });
+        this.renderRefLayers();
+      } else {
+        void loadRefData(l).then((data) => this.main.setRefLayer(l, data));
+      }
+    }
+  }
+
+  private renderRefLayers(): void {
+    const ul = $('ref-list');
+    const layers = this.store.project.refLayers;
+    if (!layers.length) {
+      ul.innerHTML = '<li class="muted small">Немає шарів. ＋ — додати з файлу.</li>';
+      return;
+    }
+    ul.innerHTML = layers
+      .map((l) => {
+        const st = refStatus(l);
+        const info =
+          st.state === 'ready'
+            ? `${st.count}`
+            : st.state === 'loading'
+              ? '…'
+              : st.state === 'missing'
+                ? '<span title="Файл з даними ще не додано в застосунок">немає даних</span>'
+                : st.state === 'error'
+                  ? `<span title="${esc(st.message ?? '')}">помилка</span>`
+                  : '';
+        return `<li data-id="${l.id}" title="${esc(l.attribution ?? '')}">
+          <input type="checkbox" data-act="vis" ${l.visible ? 'checked' : ''} title="Показувати">
+          <input type="color" data-act="color" value="${l.color}" title="Колір">
+          <span class="name">${esc(l.name)}</span>
+          <span class="muted small">${info}</span>
+          ${l.source === 'file' ? '<button class="icon-btn danger" data-act="del" title="Видалити шар">✕</button>' : ''}
+        </li>`;
+      })
+      .join('');
+  }
+
+  private refOf(el: HTMLElement): RefLayer | undefined {
+    const id = el.closest('li')?.dataset.id;
+    return this.store.project.refLayers.find((l) => l.id === id);
+  }
+
+  /** "Add to my marks" from a reference popup. */
+  addPoiFromRef(title: string, description: string, ll: LngLat): void {
+    const cats = this.store.project.categories;
+    let cat = cats.find((c) => c.name === 'Історичні пам\'ятки');
+    if (!cat) {
+      cat = { id: uid(), name: 'Історичні пам\'ятки', color: '#862e9c', visible: true };
+      cats.push(cat);
+    }
+    cat.visible = true;
+    const poi: Poi = { id: uid(), lngLat: ll, title, description, categoryId: cat.id, tags: ['RAN'], createdAt: Date.now() };
+    this.store.project.pois.push(poi);
+    if (this.store.ui.view !== 'explore') {
+      this.deps.toast(`Мітку «${title}» додано — її видно в режимі «Перегляд».`);
+      this.store.emit('pois');
+      return;
+    }
+    this.store.ui.selectedPoiId = poi.id;
+    this.store.emit('pois');
   }
 
   private renderCategories(): void {
@@ -415,6 +501,46 @@ export class Explore {
         store.emit('style');
       } else if (t.dataset.act === 'fit') {
         this.main.fitOverlay(l.id);
+      }
+    });
+
+    // reference layers
+    $('add-ref-layer').addEventListener('click', () => $('ref-file-input').click());
+    $<HTMLInputElement>('ref-file-input').addEventListener('change', async (e) => {
+      const input = e.target as HTMLInputElement;
+      const f = input.files?.[0];
+      input.value = '';
+      if (!f) return;
+      try {
+        const data = parseRefFile(f.name, await f.text());
+        const color = CATEGORY_COLORS[store.project.refLayers.length % CATEGORY_COLORS.length];
+        store.project.refLayers.push(newFileLayer(f.name, data, color));
+        store.emit('pois');
+        this.deps.toast(`Додано шар «${f.name}»: ${data.features.length} точок`);
+      } catch (err) {
+        this.deps.toast((err as Error).message, 'error');
+      }
+    });
+    const refList = $('ref-list');
+    refList.addEventListener('input', (e) => {
+      const t = e.target as HTMLInputElement;
+      const l = this.refOf(t);
+      if (l && t.dataset.act === 'color') {
+        l.color = t.value;
+        store.emit('pois');
+      }
+    });
+    refList.addEventListener('click', (e) => {
+      const t = e.target as HTMLElement;
+      const l = this.refOf(t);
+      if (!l) return;
+      if (t.dataset.act === 'vis') {
+        l.visible = (t as HTMLInputElement).checked;
+        store.emit('pois');
+      } else if (t.dataset.act === 'del' && confirm(`Видалити шар «${l.name}»?`)) {
+        store.project.refLayers = store.project.refLayers.filter((x) => x.id !== l.id);
+        this.main.removeRefLayer(l.id);
+        store.emit('pois');
       }
     });
 

@@ -44,12 +44,43 @@ export interface Poi {
   createdAt: number;
 }
 
+/** A GeoJSON FeatureCollection of points (reference data such as heritage registers). */
+export interface PointCollection {
+  type: 'FeatureCollection';
+  features: {
+    type: 'Feature';
+    geometry: { type: 'Point'; coordinates: [number, number] };
+    properties: Record<string, unknown>;
+  }[];
+}
+
+/**
+ * Reference layer: read-only points from an external database (e.g. the
+ * Romanian National Archaeological Record, RAN), shown on top of the maps and
+ * switchable on/off. Built-in ones come from public/data/heritage/index.json
+ * and are fetched on demand; layers imported from a file keep their data here.
+ */
+export interface RefLayer {
+  id: string;
+  name: string;
+  color: string;
+  visible: boolean;
+  source: 'builtin' | 'file';
+  /** builtin: URL of the GeoJSON file, relative to the app */
+  url?: string;
+  /** short attribution / description */
+  attribution?: string;
+  /** file layers: the data itself */
+  data?: PointCollection;
+}
+
 export interface Project {
   id: string;
   name: string;
   layers: Layer[];
   categories: Category[];
   pois: Poi[];
+  refLayers: RefLayer[];
   activeLayerId: string | null;
   basemap: BasemapId;
   view?: { center: LngLat; zoom: number };
@@ -109,6 +140,7 @@ export function newProject(): Project {
     layers: [],
     categories: defaultCategories(),
     pois: [],
+    refLayers: [],
     activeLayerId: null,
     basemap: 'hybrid',
   };
@@ -118,6 +150,7 @@ export function newProject(): Project {
 export function normalizeProject(p: Project): Project {
   if (!Array.isArray(p.categories) || !p.categories.length) p.categories = defaultCategories();
   if (!Array.isArray(p.pois)) p.pois = [];
+  if (!Array.isArray(p.refLayers)) p.refLayers = [];
   for (const poi of p.pois) {
     poi.tags ??= [];
     poi.description ??= '';
