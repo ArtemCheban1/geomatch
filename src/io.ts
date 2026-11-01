@@ -1,7 +1,7 @@
 /** Import / export: project files, QGIS GCP files, georeferenced PNG + world file. */
 import type { ControlPoint, Georef } from './geo/georef';
 import type { WarpResult } from './geo/warp';
-import type { Layer, Project } from './state';
+import type { Layer, Poi, Project } from './state';
 import { uid } from './state';
 
 export function download(name: string, data: Blob | string, type = 'application/octet-stream'): void {
@@ -127,4 +127,62 @@ export async function exportGeoPng(name: string, res: WarpResult): Promise<void>
   download(`${base}.pgw`, pgw, 'text/plain');
   await new Promise((r) => setTimeout(r, 300));
   download(`${base}.prj`, PRJ_3857, 'text/plain');
+}
+
+// ---------- points of interest (GeoJSON) ----------
+
+export function exportPoisGeoJson(p: Project): string {
+  const cats = new Map(p.categories.map((c) => [c.id, c]));
+  return JSON.stringify(
+    {
+      type: 'FeatureCollection',
+      features: p.pois.map((poi) => ({
+        type: 'Feature',
+        id: poi.id,
+        geometry: { type: 'Point', coordinates: poi.lngLat },
+        properties: {
+          title: poi.title,
+          description: poi.description,
+          category: cats.get(poi.categoryId)?.name ?? '',
+          color: cats.get(poi.categoryId)?.color ?? '',
+          tags: poi.tags,
+          createdAt: new Date(poi.createdAt).toISOString(),
+        },
+      })),
+    },
+    null,
+    2,
+  );
+}
+
+/** Adds POIs from a GeoJSON file to the project (categories are matched by name or created). Returns the count. */
+export function importPoisGeoJson(p: Project, text: string): number {
+  const data = JSON.parse(text);
+  const features: any[] = data?.type === 'FeatureCollection' ? data.features : data?.type === 'Feature' ? [data] : [];
+  let n = 0;
+  for (const f of features) {
+    if (f?.geometry?.type !== 'Point') continue;
+    const [lng, lat] = f.geometry.coordinates ?? [];
+    if (!Number.isFinite(lng) || !Number.isFinite(lat)) continue;
+    const props = f.properties ?? {};
+    const catName = String(props.category ?? '').trim();
+    let cat = catName ? p.categories.find((c) => c.name === catName) : p.categories[0];
+    if (!cat) {
+      cat = { id: uid(), name: catName, color: /^#[0-9a-f]{6}$/i.test(props.color) ? props.color : '#495057', visible: true };
+      p.categories.push(cat);
+    }
+    const poi: Poi = {
+      id: uid(),
+      lngLat: [lng, lat],
+      title: String(props.title ?? props.name ?? 'Мітка'),
+      description: String(props.description ?? ''),
+      categoryId: cat.id,
+      tags: Array.isArray(props.tags) ? props.tags.map(String) : [],
+      createdAt: Date.parse(props.createdAt) || Date.now(),
+    };
+    p.pois.push(poi);
+    n++;
+  }
+  if (!n) throw new Error('У файлі не знайдено точок (GeoJSON Point).');
+  return n;
 }

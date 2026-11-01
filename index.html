@@ -10,6 +10,10 @@
     <header class="topbar">
       <div class="brand"><span class="logo">◎</span> Геомач</div>
       <input id="project-name" class="project-name" title="Назва проєкту" />
+      <div class="segmented dark" id="view-switch">
+        <button data-view="georef" title="Прив'язка карт за контрольними точками">🎯 Прив'язка</button>
+        <button data-view="explore" title="Робота з готовою картою: порівняння, мітки (Tab)">🗺 Перегляд</button>
+      </div>
       <div class="spacer"></div>
       <label class="btn primary" title="Додати скан/фото карти (можна кілька)">
         + Додати карту
@@ -25,12 +29,16 @@
           <button data-action="export-points">Експорт точок (QGIS .points)</button>
           <button data-action="import-points">Імпорт точок (QGIS .points)…</button>
           <hr />
+          <button data-action="export-pois">Експорт міток (GeoJSON)</button>
+          <button data-action="import-pois">Імпорт міток (GeoJSON)…</button>
+          <hr />
           <button data-action="new-project">Новий проєкт</button>
         </div>
       </div>
       <button class="btn icon" id="help-btn" title="Довідка">?</button>
       <input type="file" id="open-project-input" accept=".json,application/json" hidden />
       <input type="file" id="import-points-input" accept=".points,.txt,.csv" hidden />
+      <input type="file" id="import-pois-input" accept=".geojson,.json,application/geo+json,application/json" hidden />
     </header>
 
     <main class="workspace">
@@ -92,21 +100,75 @@
         </div>
       </section>
 
-      <section class="pane">
+      <section class="pane map-pane">
         <div class="pane-toolbar">
           <select id="basemap-select" title="Підкладка"></select>
           <form id="search-form" class="search">
             <input id="search-input" type="search" placeholder="Знайти місце…" />
           </form>
           <div class="spacer"></div>
-          <label class="opacity" title="Прозорість накладеної карти ([ і ])">
+          <!-- georeferencing tools -->
+          <button class="btn small georef-only" id="nudge-btn" title="Підтягнути: тягніть накладену карту мишею в місці, де вона не збігається (N)">🧲 Підтягнути</button>
+          <label class="opacity georef-only" title="Прозорість накладеної карти ([ і ])">
             <span>◐</span>
             <input type="range" id="overlay-opacity" min="0" max="1" step="0.05" />
           </label>
-          <button class="btn small" id="overlay-toggle" title="Показати / сховати накладену карту (O)">👁</button>
-          <button class="btn small" id="overlay-fit" title="Наблизити до накладеної карти">⤢</button>
+          <button class="btn small georef-only" id="overlay-toggle" title="Показати / сховати накладену карту (O)">👁</button>
+          <button class="btn small georef-only" id="overlay-fit" title="Наблизити до накладеної карти">⤢</button>
+          <!-- explore tools -->
+          <div class="segmented explore-only" id="compare-switch">
+            <button data-compare="overlay" title="Стара карта поверх сучасної з прозорістю (1)">◐ Накладка</button>
+            <button data-compare="swipe" title="Шторка: тягніть повзунок (2)">⇹ Шторка</button>
+            <button data-compare="lens" title="Лупа: під курсором видно іншу карту (3)">◎ Лупа</button>
+            <button data-compare="side" title="Дві карти поруч (4)">◫ Поруч</button>
+          </div>
+          <select id="compare-target" class="explore-only" title="З чим порівнювати"></select>
+          <button class="btn small explore-only" id="flip-btn" title="Сховати/показати старі карти (утримуйте Пробіл)">⇆</button>
+          <button class="btn small explore-only" id="add-poi-btn" title="Додати мітку на карту (M)">📍 Мітка</button>
+          <button class="btn small icon" id="fullscreen-btn" title="Повний екран (F)">⛶</button>
         </div>
-        <div class="pane-body" id="map"></div>
+        <div class="pane-body map-stage" id="map-stage">
+          <div id="map" class="map-fill"></div>
+          <div id="compare-map" class="map-fill"></div>
+          <div id="swipe-handle" class="swipe-handle"><span>⇹</span></div>
+          <div id="compare-label" class="compare-label"></div>
+
+          <aside id="explore-panel" class="explore-panel">
+            <button class="explore-panel-toggle" id="explore-panel-toggle" title="Згорнути / розгорнути">☰ Шари і мітки</button>
+            <div class="explore-panel-body">
+              <section>
+                <h3>Карти</h3>
+                <ul id="explore-layers" class="explore-layers"></ul>
+              </section>
+              <section>
+                <h3>Категорії міток <button class="icon-btn" id="add-category" title="Нова категорія">＋</button></h3>
+                <ul id="category-list" class="category-list"></ul>
+              </section>
+              <section class="grow">
+                <h3>Мітки <span class="muted small" id="poi-count"></span></h3>
+                <input type="search" id="poi-search" placeholder="Пошук: назва, опис, #тег…" />
+                <ul id="poi-list" class="poi-list"></ul>
+              </section>
+            </div>
+          </aside>
+
+          <aside id="poi-editor" class="poi-editor">
+            <div class="poi-editor-head">
+              <b>Мітка</b>
+              <button class="icon-btn" id="poi-close" title="Закрити">✕</button>
+            </div>
+            <label>Назва <input id="poi-title" placeholder="Напр. Млин на річці" /></label>
+            <label>Категорія <select id="poi-category"></select></label>
+            <label>Теги <input id="poi-tags" placeholder="через кому: млин, XIX ст." /></label>
+            <label>Опис <textarea id="poi-desc" rows="6" placeholder="Що тут було, джерела, нотатки…"></textarea></label>
+            <div class="muted small mono" id="poi-coords"></div>
+            <div class="poi-editor-actions">
+              <button class="btn small" id="poi-delete">🗑 Видалити</button>
+              <div class="spacer"></div>
+              <button class="btn small primary" id="poi-done">Готово</button>
+            </div>
+          </aside>
+        </div>
       </section>
     </main>
 
@@ -123,11 +185,18 @@
         <li>Слідкуйте за <b>похибкою</b>: червоні лінії на карті показують, наскільки точка не вписується в модель. Точку можна перетягнути або вимкнути.</li>
         <li>Для фото під кутом виберіть «Проєктивне», для сильно викривлених старих карт — «Поліном 2» або «Thin Plate Spline».</li>
         <li>Режим <b>✂ Обрізка</b>: клікайте вершини, подвійний клік / Enter — завершити. На карту потрапить лише вибрана частина (без полів, легенди).</li>
+        <li><b>🧲 Підтягнути</b>: якщо десь дорога чи перехрестя не збігаються на 10–30 м — схопіть накладену карту в цьому місці й перетягніть туди, де воно має бути. Карта локально «дотягнеться» (гумовий лист), а решта залишиться на місці.</li>
+        <li><b>🗺 Перегляд</b>: повноекранна робота з готовою картою — шторка, лупа, дві карти поруч, швидке перемикання Пробілом, мітки з категоріями, тегами й описом.</li>
       </ol>
       <h3>Клавіші</h3>
       <p class="small">
         <kbd>A</kbd> точки · <kbd>C</kbd> обрізка · <kbd>V</kbd> огляд · <kbd>Esc</kbd> скасувати ·
-        <kbd>Del</kbd> видалити вибрану точку · <kbd>O</kbd> показати/сховати накладку · <kbd>[</kbd> <kbd>]</kbd> прозорість
+        <kbd>Del</kbd> видалити вибрану точку · <kbd>O</kbd> показати/сховати накладку · <kbd>[</kbd> <kbd>]</kbd> прозорість ·
+        <kbd>N</kbd> підтягнути · <kbd>Tab</kbd> прив'язка / перегляд · <kbd>F</kbd> повний екран
+      </p>
+      <p class="small">
+        Перегляд: <kbd>1</kbd>–<kbd>4</kbd> накладка / шторка / лупа / поруч · утримуйте <kbd>Пробіл</kbd> — сховати старі карти ·
+        <kbd>M</kbd> нова мітка
       </p>
       <p class="small muted">Проєкт автоматично зберігається в браузері. Для перенесення на інший комп'ютер — «Файл → Зберегти проєкт».</p>
       <form method="dialog"><button class="btn primary">Зрозуміло</button></form>

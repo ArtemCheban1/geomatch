@@ -7,14 +7,43 @@ import type { ImageSource, StyleSpecification, MapMouseEvent } from 'maplibre-gl
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { mercToLngLat, type LngLat } from '../geo/mercator';
 import type { WarpResult } from '../geo/warp';
-import type { BasemapId, Layer, Store } from '../state';
+import type { BasemapId, Layer, Poi, Store } from '../state';
 
 export interface MapViewEvents {
   addPoint(ll: LngLat): void;
   movePoint(id: string, ll: LngLat): void;
   select(id: string | null): void;
   viewChanged(center: LngLat, zoom: number): void;
+  /** Nudge tool: drag started at `ll` on the overlay; returns the id of the created control point. */
+  nudgeStart(ll: LngLat): string | null;
+  nudgeMove(id: string, ll: LngLat): void;
+  nudgeEnd(id: string, moved: boolean): void;
+  /** Click on the map in explore view. */
+  exploreClick(ll: LngLat): void;
+  poiSelect(id: string): void;
+  poiMove(id: string, ll: LngLat): void;
 }
+
+/** A no-op implementation, for maps that are view-only (compare map). */
+export const NO_EVENTS: MapViewEvents = {
+  addPoint: () => {},
+  movePoint: () => {},
+  select: () => {},
+  viewChanged: () => {},
+  nudgeStart: () => null,
+  nudgeMove: () => {},
+  nudgeEnd: () => {},
+  exploreClick: () => {},
+  poiSelect: () => {},
+  poiMove: () => {},
+};
+
+/**
+ * main    — the working map: overlays of visible layers, control points, POIs
+ * compare — second map used for swipe / lens / side-by-side; shows the basemap
+ *           and at most one chosen layer (store.ui.compareLayerId)
+ */
+export type MapRole = 'main' | 'compare';
 
 export const BASEMAPS: { id: BasemapId; label: string }[] = [
   { id: 'hybrid', label: 'Гібрид' },
@@ -88,6 +117,9 @@ export class MapView {
   private ready: Promise<void>;
   private markers = new Map<string, { marker: maplibregl.Marker; el: HTMLElement }>();
   private pendingMarker: maplibregl.Marker | null = null;
+  private poiMarkers = new Map<string, { marker: maplibregl.Marker; el: HTMLElement }>();
+  /** temporarily hide all overlays (flip compare) */
+  private overlaysHidden = false;
   private ghostMarker: maplibregl.Marker | null = null;
   /** layer id → bounds of the overlay currently on the map */
   private overlays = new Map<string, WarpResult['bounds']>();
@@ -99,6 +131,7 @@ export class MapView {
     container: HTMLElement,
     private store: Store,
     private events: MapViewEvents,
+    readonly role: MapRole = 'main',
   ) {
     const view = store.project.view;
     this.map = new maplibregl.Map({
@@ -109,8 +142,10 @@ export class MapView {
       maxZoom: 21,
       attributionControl: { compact: true },
     });
-    this.map.addControl(new maplibregl.NavigationControl({ visualizePitch: false }), 'top-right');
-    this.map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
+    if (role === 'main') {
+      this.map.addControl(new maplibregl.NavigationControl({ visualizePitch: false }), 'top-right');
+      this.map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
+    }
     this.map.dragRotate.disable();
     this.map.touchZoomRotate.disableRotation();
     this.ready = new Promise((resolve) =>
@@ -121,12 +156,16 @@ export class MapView {
     );
 
     this.map.on('click', (e: MapMouseEvent) => {
-      if (this.store.ui.mode === 'points' && this.store.activeLayer) {
-        this.events.addPoint([e.lngLat.lng, e.lngLat.lat]);
-      } else {
+      const ll: LngLat = [e.lngLat.lng, e.lngLat.lat];
+      if (this.store.ui.view === 'explore') {
+        this.events.exploreClick(ll);
+      } else if (this.store.ui.mode === 'points' && this.store.activeLayer) {
+        this.events.addPoint(ll);
+      } else if (this.store.ui.mode !== 'nudge') {
         this.events.select(null);
       }
     });
+    this.bindNudge();
     this.map.on('moveend', () => {
       const c = this.map.getCenter();
       this.events.viewChanged([c.lng, c.lat], this.map.getZoom());
@@ -189,8 +228,12 @@ export class MapView {
           id,
           type: 'raster',
           source: id,
-          paint: { 'raster-opacity': layer.opacity, 'raster-fade-duration': 0, 'raster-resampling': 'linear' },
-          layout: { visibility: layer.visible ? 'visible' : 'none' },
+          paint: {
+            'raster-opacity': this.opacityFor(layer),
+            'raster-fade-duration': 0,
+            'raster-resampling': 'linear',
+          },
+          layout: { visibility: this.isOverlayVisible(layer) ? 'visible' : 'none' },
         },
         OVERLAY_BEFORE,
       );
@@ -215,10 +258,29 @@ export class MapView {
     for (const l of this.store.project.layers) {
       const id = `ov-${l.id}`;
       if (!this.map.getLayer(id)) continue;
-      this.map.setPaintProperty(id, 'raster-opacity', l.opacity);
-      this.map.setLayoutProperty(id, 'visibility', l.visible ? 'visible' : 'none');
+      this.map.setPaintProperty(id, 'raster-opacity', this.opacityFor(l));
+      this.map.setLayoutProperty(id, 'visibility', this.isOverlayVisible(l) ? 'visible' : 'none');
     }
     this.reorderOverlays();
+  }
+
+  private isOverlayVisible(l: Layer): boolean {
+    if (this.role === 'compare') return l.id === this.store.ui.compareLayerId;
+    return l.visible && !this.overlaysHidden;
+  }
+
+  private opacityFor(l: Layer): number {
+    return this.role === 'compare' ? 1 : l.opacity;
+  }
+
+  /** Hide / show all overlays at once (quick flip between old and modern map). */
+  setOverlaysHidden(hidden: boolean): void {
+    this.overlaysHidden = hidden;
+    this.syncOverlayStyles();
+  }
+
+  get areOverlaysHidden(): boolean {
+    return this.overlaysHidden;
   }
 
   /** Keep overlays in project layer order (last = on top). */
@@ -240,10 +302,12 @@ export class MapView {
   // ---------- control points ----------
 
   syncPoints(residualLines: [LngLat, LngLat][]): void {
-    const layer = this.store.activeLayer;
     const ui = this.store.ui;
+    const georef = ui.view === 'georef' && this.role === 'main';
+    const layer = georef ? this.store.activeLayer : null;
     const points = layer?.points ?? [];
     const seen = new Set<string>();
+    if (!georef) residualLines = [];
 
     points.forEach((p, i) => {
       seen.add(p.id);
@@ -280,7 +344,7 @@ export class MapView {
     }
 
     // pending point (map side clicked first)
-    if (ui.pending?.lngLat) {
+    if (georef && ui.pending?.lngLat) {
       if (!this.pendingMarker) {
         const el = document.createElement('div');
         el.className = 'gcp-marker pending';
@@ -305,7 +369,7 @@ export class MapView {
   }
 
   setGhost(ll: LngLat | null): void {
-    if (!ll) {
+    if (!ll || this.store.ui.view !== 'georef') {
       this.ghostMarker?.remove();
       return;
     }
@@ -316,6 +380,99 @@ export class MapView {
       this.ghostMarker = new maplibregl.Marker({ element: el, anchor: 'center' });
     }
     this.ghostMarker.setLngLat(ll).addTo(this.map);
+  }
+
+  // ---------- nudge tool ----------
+
+  /**
+   * Drag on the map pulls the overlay: the spot under the cursor at mousedown
+   * becomes a new control point whose map position follows the cursor.
+   */
+  private bindNudge(): void {
+    let dragging: { id: string; moved: boolean } | null = null;
+    const canvas = this.map.getCanvasContainer();
+
+    this.map.on('mousedown', (e: MapMouseEvent) => {
+      const ui = this.store.ui;
+      if (this.role !== 'main' || ui.view !== 'georef' || ui.mode !== 'nudge' || e.originalEvent.button !== 0) return;
+      const id = this.events.nudgeStart([e.lngLat.lng, e.lngLat.lat]);
+      if (!id) return;
+      e.preventDefault(); // keep the map from panning
+      dragging = { id, moved: false };
+      canvas.style.cursor = 'grabbing';
+    });
+    this.map.on('mousemove', (e: MapMouseEvent) => {
+      if (!dragging) {
+        const ui = this.store.ui;
+        canvas.style.cursor = ui.view === 'georef' && ui.mode === 'nudge' ? 'grab' : '';
+        return;
+      }
+      dragging.moved = true;
+      this.events.nudgeMove(dragging.id, [e.lngLat.lng, e.lngLat.lat]);
+    });
+    const end = () => {
+      if (!dragging) return;
+      const d = dragging;
+      dragging = null;
+      canvas.style.cursor = '';
+      this.events.nudgeEnd(d.id, d.moved);
+    };
+    this.map.on('mouseup', end);
+    window.addEventListener('mouseup', end);
+  }
+
+  // ---------- points of interest ----------
+
+  syncPois(): void {
+    const { pois, categories } = this.store.project;
+    const ui = this.store.ui;
+    const show = this.role === 'main' && ui.view === 'explore';
+    const catById = new Map(categories.map((c) => [c.id, c]));
+    const seen = new Set<string>();
+    if (show) {
+      for (const poi of pois) {
+        const cat = catById.get(poi.categoryId);
+        if (!cat?.visible) continue;
+        seen.add(poi.id);
+        let m = this.poiMarkers.get(poi.id);
+        if (!m) m = this.createPoiMarker(poi);
+        m.marker.setLngLat(poi.lngLat);
+        m.el.style.setProperty('--pin', cat.color);
+        (m.el.querySelector('.poi-label') as HTMLElement).textContent = poi.title;
+        m.el.classList.toggle('selected', poi.id === ui.selectedPoiId);
+      }
+    }
+    for (const [id, m] of this.poiMarkers) {
+      if (!seen.has(id)) {
+        m.marker.remove();
+        this.poiMarkers.delete(id);
+      }
+    }
+  }
+
+  private createPoiMarker(poi: Poi): { marker: maplibregl.Marker; el: HTMLElement } {
+    const el = document.createElement('div');
+    el.className = 'poi-marker';
+    el.innerHTML = `<svg viewBox="0 0 24 32" width="26" height="34"><path d="M12 0C5.4 0 0 5.3 0 11.9 0 20.8 12 32 12 32s12-11.2 12-20.1C24 5.3 18.6 0 12 0z" fill="var(--pin)" stroke="#fff" stroke-width="1.5"/><circle cx="12" cy="12" r="4.5" fill="#fff"/></svg><span class="poi-label"></span>`;
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.events.poiSelect(poi.id);
+    });
+    const marker = new maplibregl.Marker({ element: el, draggable: true, anchor: 'bottom' })
+      .setLngLat(poi.lngLat)
+      .addTo(this.map);
+    marker.on('dragstart', () => this.events.poiSelect(poi.id));
+    marker.on('dragend', () => {
+      const ll = marker.getLngLat();
+      this.events.poiMove(poi.id, [ll.lng, ll.lat]);
+    });
+    const m = { marker, el };
+    this.poiMarkers.set(poi.id, m);
+    return m;
+  }
+
+  flyTo(ll: LngLat, minZoom = 15): void {
+    this.map.flyTo({ center: ll, zoom: Math.max(this.map.getZoom(), minZoom), duration: 800 });
   }
 
   panTo(ll: LngLat): void {

@@ -3,8 +3,32 @@ import { computeGeoref, lngLatToPixel, pixelToLngLat, type Georef } from './geo/
 import { mercToLngLat, type LngLat } from './geo/mercator';
 import { applyTransform, TRANSFORMS, transformInfo, type Pt, type TransformKind } from './geo/transforms';
 import { WarpClient } from './geo/warpClient';
-import { download, exportGeoPng, exportProject, exportQgisPoints, importProject, importQgisPoints, baseName } from './io';
-import { loadProject, newProject, Store, uid, type BasemapId, type Layer, type Mode } from './state';
+import type { WarpResult } from './geo/warp';
+import {
+  download,
+  exportGeoPng,
+  exportPoisGeoJson,
+  exportProject,
+  exportQgisPoints,
+  importPoisGeoJson,
+  importProject,
+  importQgisPoints,
+  baseName,
+} from './io';
+import {
+  initialUi,
+  loadProject,
+  newProject,
+  normalizeProject,
+  Store,
+  uid,
+  type BasemapId,
+  type CompareMode,
+  type Layer,
+  type Mode,
+  type View,
+} from './state';
+import { Explore } from './ui/explore';
 import { ImageView } from './ui/imageView';
 import { BASEMAPS, MapView } from './ui/mapView';
 
@@ -26,8 +50,12 @@ const registeredSources = new Set<string>();
 const warpSeq = new Map<string, number>();
 const warpTimers = new Map<string, number>();
 
+/** Last warped raster per layer (re-used by the compare map). */
+const warpResults = new Map<string, WarpResult>();
+
 let imageView: ImageView;
 let mapView: MapView;
+let explore: Explore;
 
 // ---------------------------------------------------------------- helpers
 
@@ -95,6 +123,8 @@ async function runWarp(layer: Layer): Promise<void> {
   const fit = fits.get(layer.id) ?? fitLayer(layer);
   if (!fit.display) {
     mapView.removeOverlay(layer.id);
+    explore.removeOverlay(layer.id);
+    warpResults.delete(layer.id);
     return;
   }
   const seq = (warpSeq.get(layer.id) ?? 0) + 1;
@@ -110,7 +140,9 @@ async function runWarp(layer: Layer): Promise<void> {
     });
     if (warpSeq.get(layer.id) !== seq) return; // stale
     if (!store.project.layers.includes(layer)) return; // deleted meanwhile
+    warpResults.set(layer.id, res);
     await mapView.setOverlay(layer, res);
+    explore.onOverlay(layer, res);
   } catch (e) {
     if (warpSeq.get(layer.id) === seq) toast((e as Error).message, 'error');
   }
@@ -224,8 +256,52 @@ function setClip(layer: Layer, clip: Pt[] | null): void {
   scheduleWarp(layer, 0);
 }
 
+// ---------------------------------------------------------------- nudge (rubber-sheet fine tuning)
+
+/**
+ * Checks that nudging is possible and switches the layer to TPS, which passes
+ * exactly through every control point — so a dragged spot lands exactly where
+ * it is dropped while the rest of the map stays pinned by the other points.
+ */
+function prepareNudge(): boolean {
+  const layer = store.activeLayer;
+  const fit = layer ? fits.get(layer.id) : undefined;
+  if (!layer || !fit?.display) {
+    toast('Спочатку прив\'яжіть карту хоча б за 2–3 точками.');
+    return false;
+  }
+  if (layer.transform !== 'tps') {
+    layer.transform = 'tps';
+    store.emit('points');
+    toast('Перемкнено на «гумовий лист» (TPS): карта точно проходитиме через кожну точку.');
+  }
+  return true;
+}
+
+function nudgeStart(ll: LngLat): string | null {
+  const layer = store.activeLayer;
+  const g = layer ? fits.get(layer.id)?.display : null;
+  if (!layer || !g) return null;
+  const img = lngLatToPixel(g, ll);
+  if (!(img.x >= 0 && img.y >= 0 && img.x <= layer.width && img.y <= layer.height)) {
+    toast('Тягніть саму накладену карту — тут її немає.');
+    return null;
+  }
+  const id = uid();
+  layer.points.push({ id, img, lngLat: ll, enabled: true });
+  store.ui.selectedPointId = id;
+  store.emit('points');
+  return id;
+}
+
+function nudgeEnd(id: string, moved: boolean): void {
+  // a plain click without dragging shouldn't leave a useless point behind
+  if (!moved) deletePoint(id);
+}
+
 function setMode(mode: Mode): void {
   if (store.ui.mode === mode) return;
+  if (mode === 'nudge' && !prepareNudge()) return;
   store.ui.mode = mode;
   store.ui.pending = null;
   store.ui.clipDraft = mode === 'clip' ? [] : null;
@@ -281,6 +357,8 @@ function deleteLayer(id: string): void {
   if (layer.points.length && !confirm(`Видалити «${layer.name}» разом з ${layer.points.length} точками?`)) return;
   store.project.layers = store.project.layers.filter((l) => l.id !== id);
   mapView.removeOverlay(id);
+  explore.removeOverlay(id);
+  warpResults.delete(id);
   warp.drop(id);
   registeredSources.delete(id);
   fits.delete(id);
@@ -301,10 +379,14 @@ function moveLayer(id: string, dir: -1 | 1): void {
 async function loadIntoStore(p: ReturnType<typeof newProject>): Promise<void> {
   for (const id of registeredSources) warp.drop(id);
   registeredSources.clear();
-  for (const l of store.project.layers) mapView.removeOverlay(l.id);
+  for (const l of store.project.layers) {
+    mapView.removeOverlay(l.id);
+    explore.removeOverlay(l.id);
+  }
   fits.clear();
-  store.project = p;
-  store.ui = { mode: 'points', pending: null, selectedPointId: null, clipDraft: null };
+  warpResults.clear();
+  store.project = normalizeProject(p);
+  store.ui = { ...initialUi(), view: store.ui.view };
   store.emit('load');
   mapView.setBasemap(p.basemap);
   for (const l of p.layers) {
@@ -397,7 +479,7 @@ function renderTransform(): void {
     if (scale) html += `<div class="muted small">≈ ${scale}</div>`;
   } else {
     const need = info.minPoints - n;
-    html = `<div class="status">Потрібно ще <b>${need}</b> ${plural(need, 'точка', 'точки', 'точок')}}.</div>`;
+    html = `<div class="status">Потрібно ще <b>${need}</b> ${plural(need, 'точка', 'точки', 'точок')}.</div>`;
     if (fit?.preview && fit.previewKind) {
       html += `<div class="muted small">Поки що попередній перегляд: ${transformInfo(fit.previewKind).label}.</div>`;
     }
@@ -464,11 +546,16 @@ function renderModeAndHint(): void {
       ? 'Обрізка: клікайте вершини області, яку треба залишити.'
       : 'Обрізка: подвійний клік або Enter — завершити, Esc — скасувати.';
   } else if (mode === 'pan') hint = 'Режим огляду: кліки не створюють точок.';
+  else if (mode === 'nudge') hint = '🧲 Підтягнути: схопіть накладену карту там, де вона не збігається (дорога, перехрестя), і перетягніть на правильне місце. Esc — вийти.';
   else if (pending?.img) hint = `Точка ${layer.points.length + 1}: тепер клікніть <b>те саме місце на карті</b> праворуч. Esc — скасувати.`;
   else if (pending?.lngLat) hint = `Точка ${layer.points.length + 1}: тепер клікніть <b>те саме місце на зображенні</b> ліворуч. Esc — скасувати.`;
   else if (layer.points.length < 3) hint = 'Клікніть характерне місце на зображенні (перехрестя, церква, міст…), потім те саме місце на карті.';
   else hint = 'Додавайте точки по кутах карти для точності. Перетягуйте маркери, щоб уточнити.';
   $('hint').innerHTML = hint;
+  $('nudge-btn').classList.toggle('active', mode === 'nudge');
+  document.querySelectorAll<HTMLButtonElement>('#view-switch button').forEach((b) => {
+    b.classList.toggle('active', b.dataset.view === store.ui.view);
+  });
 
   // overlay controls
   const op = $<HTMLInputElement>('overlay-opacity');
@@ -522,6 +609,7 @@ function onChange(reason: string): void {
     $<HTMLSelectElement>('basemap-select').value = store.project.basemap;
   }
   if (reason === 'style' || reason === 'layers' || reason === 'load') mapView.syncOverlayStyles();
+  explore.render();
 
   renderLayers();
   renderTransform();
@@ -552,6 +640,7 @@ function initControls(): void {
   bm.addEventListener('change', () => {
     store.project.basemap = bm.value as BasemapId;
     mapView.setBasemap(store.project.basemap);
+    explore.setBasemap();
     store.emit('style');
   });
 
@@ -691,10 +780,37 @@ function initControls(): void {
     if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     const l = store.activeLayer;
+    const inExplore = store.ui.view === 'explore';
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      setView(inExplore ? 'georef' : 'explore');
+      return;
+    }
+    if (e.key === 'f' || e.key === 'F') return toggleFullscreen();
+    if (inExplore) {
+      const compareKeys: Record<string, CompareMode> = { '1': 'overlay', '2': 'swipe', '3': 'lens', '4': 'side' };
+      if (compareKeys[e.key]) return explore.setCompare(compareKeys[e.key]);
+      if (e.key === ' ') {
+        e.preventDefault();
+        if (!e.repeat) explore.flip(true);
+        return;
+      }
+      if (e.key === 'm' || e.key === 'M') return explore.toggleAddPoi();
+      if (e.key === 'Escape') {
+        store.ui.addingPoi = false;
+        store.ui.selectedPoiId = null;
+        store.emit('ui');
+      }
+      return;
+    }
     switch (e.key) {
       case 'Escape':
         cancelPending();
-        if (store.ui.mode === 'clip') setMode('points');
+        if (store.ui.mode === 'clip' || store.ui.mode === 'nudge') setMode('points');
+        break;
+      case 'n':
+      case 'N':
+        setMode(store.ui.mode === 'nudge' ? 'points' : 'nudge');
         break;
       case 'Enter':
         if (store.ui.mode === 'clip') clipFinish();
@@ -728,6 +844,50 @@ function initControls(): void {
         break;
     }
   });
+  window.addEventListener('keyup', (e) => {
+    if (e.key === ' ' && store.ui.view === 'explore') explore.flip(false);
+  });
+
+  // view switch, nudge, fullscreen
+  document.querySelectorAll<HTMLButtonElement>('#view-switch button').forEach((b) =>
+    b.addEventListener('click', () => setView(b.dataset.view as View)),
+  );
+  $('nudge-btn').addEventListener('click', () => setMode(store.ui.mode === 'nudge' ? 'points' : 'nudge'));
+  $('fullscreen-btn').addEventListener('click', toggleFullscreen);
+
+  $<HTMLInputElement>('import-pois-input').addEventListener('change', async (e) => {
+    const input = e.target as HTMLInputElement;
+    const f = input.files?.[0];
+    input.value = '';
+    if (!f) return;
+    try {
+      const n = importPoisGeoJson(store.project, await f.text());
+      store.emit('pois');
+      toast(`Імпортовано ${n} міток`);
+    } catch (err) {
+      toast((err as Error).message, 'error');
+    }
+  });
+}
+
+function setView(view: View): void {
+  if (store.ui.view === view) return;
+  store.ui.view = view;
+  store.ui.pending = null;
+  store.ui.addingPoi = false;
+  if (store.ui.mode === 'clip' || store.ui.mode === 'nudge') {
+    store.ui.mode = 'points';
+    store.ui.clipDraft = null;
+  }
+  explore.flip(false);
+  store.emit('ui');
+  // the map pane changes size
+  requestAnimationFrame(() => mapView.map.resize());
+}
+
+function toggleFullscreen(): void {
+  if (document.fullscreenElement) void document.exitFullscreen();
+  else void document.documentElement.requestFullscreen?.().catch(() => toast('Повний екран недоступний'));
 }
 
 function toggleOverlay(): void {
@@ -754,6 +914,13 @@ async function fileAction(act: string): Promise<void> {
     case 'export-points':
       if (!layer) return toast('Немає активної карти');
       download(`${baseName(layer.name)}.points`, exportQgisPoints(layer, fits.get(layer.id)?.georef ?? null), 'text/plain');
+      break;
+    case 'export-pois':
+      if (!store.project.pois.length) return toast('Ще немає міток');
+      download(`${baseName(store.project.name)}-mitky.geojson`, exportPoisGeoJson(store.project), 'application/geo+json');
+      break;
+    case 'import-pois':
+      $('import-pois-input').click();
       break;
     case 'import-points':
       if (!layer) return toast('Спочатку додайте зображення карти');
@@ -806,7 +973,14 @@ async function boot(): Promise<void> {
       store.project.view = { center, zoom };
       store.save();
     },
+    nudgeStart,
+    nudgeMove: (id, ll) => movePoint(id, { lngLat: ll }),
+    nudgeEnd,
+    exploreClick: (ll) => explore.mapClick(ll),
+    poiSelect: (id) => explore.selectPoi(id),
+    poiMove: (id, ll) => explore.movePoi(id, ll),
   });
+  explore = new Explore({ store, main: mapView, warpResults, toast });
 
   store.subscribe(onChange);
   initControls();

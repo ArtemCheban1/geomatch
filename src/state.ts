@@ -25,10 +25,31 @@ export interface Layer {
   clip: Pt[] | null;
 }
 
+/** Category of user points of interest (colour + visibility). */
+export interface Category {
+  id: string;
+  name: string;
+  color: string;
+  visible: boolean;
+}
+
+/** A user point of interest placed on the map in explore mode. */
+export interface Poi {
+  id: string;
+  lngLat: LngLat;
+  title: string;
+  description: string;
+  categoryId: string;
+  tags: string[];
+  createdAt: number;
+}
+
 export interface Project {
   id: string;
   name: string;
   layers: Layer[];
+  categories: Category[];
+  pois: Poi[];
   activeLayerId: string | null;
   basemap: BasemapId;
   view?: { center: LngLat; zoom: number };
@@ -40,10 +61,30 @@ export interface PendingPoint {
   lngLat?: LngLat;
 }
 
-export type Mode = 'points' | 'clip' | 'pan';
+/**
+ * Tool mode in georeferencing view:
+ *  points — place control point pairs
+ *  clip   — draw the clip polygon
+ *  pan    — look around only
+ *  nudge  — drag the overlay on the map to pull it into place (adds TPS points)
+ */
+export type Mode = 'points' | 'clip' | 'pan' | 'nudge';
+
+/** Top-level app view. */
+export type View = 'georef' | 'explore';
+
+/** How old/new maps are compared in explore view. */
+export type CompareMode = 'overlay' | 'swipe' | 'lens' | 'side';
 
 export interface UiState {
+  view: View;
   mode: Mode;
+  compare: CompareMode;
+  /** what the compare map shows: '' = modern basemap only, otherwise a layer id */
+  compareLayerId: string;
+  /** explore view: placing a new POI on next click */
+  addingPoi: boolean;
+  selectedPoiId: string | null;
   pending: PendingPoint | null;
   selectedPointId: string | null;
   /** clip polygon being drawn */
@@ -52,8 +93,51 @@ export interface UiState {
 
 export const uid = (): string => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
 
+export function defaultCategories(): Category[] {
+  return [
+    { id: uid(), name: 'Цікаве місце', color: '#e8590c', visible: true },
+    { id: uid(), name: 'Знахідка', color: '#e03131', visible: true },
+    { id: uid(), name: 'Будівля / садиба', color: '#1c7ed6', visible: true },
+    { id: uid(), name: 'Перевірити', color: '#9c36b5', visible: true },
+  ];
+}
+
 export function newProject(): Project {
-  return { id: uid(), name: 'Новий проєкт', layers: [], activeLayerId: null, basemap: 'hybrid' };
+  return {
+    id: uid(),
+    name: 'Новий проєкт',
+    layers: [],
+    categories: defaultCategories(),
+    pois: [],
+    activeLayerId: null,
+    basemap: 'hybrid',
+  };
+}
+
+/** Fill in fields added in later versions so old saved projects keep working. */
+export function normalizeProject(p: Project): Project {
+  if (!Array.isArray(p.categories) || !p.categories.length) p.categories = defaultCategories();
+  if (!Array.isArray(p.pois)) p.pois = [];
+  for (const poi of p.pois) {
+    poi.tags ??= [];
+    poi.description ??= '';
+    if (!p.categories.some((c) => c.id === poi.categoryId)) poi.categoryId = p.categories[0].id;
+  }
+  return p;
+}
+
+export function initialUi(): UiState {
+  return {
+    view: 'georef',
+    mode: 'points',
+    compare: 'overlay',
+    compareLayerId: '',
+    addingPoi: false,
+    selectedPoiId: null,
+    pending: null,
+    selectedPointId: null,
+    clipDraft: null,
+  };
 }
 
 type Listener = (reason: ChangeReason) => void;
@@ -64,12 +148,13 @@ type Listener = (reason: ChangeReason) => void;
  *  - 'layers': layer list / images / clip
  *  - 'style':  opacity / visibility / basemap
  *  - 'ui':     selection, pending point, mode
+ *  - 'pois':   points of interest / categories
  */
-export type ChangeReason = 'points' | 'layers' | 'style' | 'ui' | 'load';
+export type ChangeReason = 'points' | 'layers' | 'style' | 'ui' | 'load' | 'pois';
 
 export class Store {
   project: Project = newProject();
-  ui: UiState = { mode: 'points', pending: null, selectedPointId: null, clipDraft: null };
+  ui: UiState = initialUi();
   private listeners: Listener[] = [];
   private saveTimer: number | undefined;
 
@@ -137,7 +222,7 @@ export async function loadProject(): Promise<Project | null> {
       req.onerror = () => reject(req.error);
     });
     db.close();
-    return p ?? null;
+    return p ? normalizeProject(p) : null;
   } catch (e) {
     console.warn('could not load project', e);
     return null;
