@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="uk">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Геомач — геореференсинг старих карт</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='14' fill='%23e8590c'/><path d='M9 16h14M16 9v14' stroke='white' stroke-width='3'/></svg>" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand"><span class="logo">◎</span> Геомач</div>
+      <input id="project-name" class="project-name" title="Назва проєкту" />
+      <div class="spacer"></div>
+      <label class="btn primary" title="Додати скан/фото карти (можна кілька)">
+        + Додати карту
+        <input type="file" id="add-image" accept="image/*" multiple hidden />
+      </label>
+      <div class="dropdown">
+        <button class="btn" id="file-menu-btn">Файл ▾</button>
+        <div class="dropdown-menu" id="file-menu">
+          <button data-action="save-project">Зберегти проєкт (.geomatch.json)</button>
+          <button data-action="open-project">Відкрити проєкт…</button>
+          <hr />
+          <button data-action="export-png">Експорт: PNG + world file (.pgw)</button>
+          <button data-action="export-points">Експорт точок (QGIS .points)</button>
+          <button data-action="import-points">Імпорт точок (QGIS .points)…</button>
+          <hr />
+          <button data-action="new-project">Новий проєкт</button>
+        </div>
+      </div>
+      <button class="btn icon" id="help-btn" title="Довідка">?</button>
+      <input type="file" id="open-project-input" accept=".json,application/json" hidden />
+      <input type="file" id="import-points-input" accept=".points,.txt,.csv" hidden />
+    </header>
+
+    <main class="workspace">
+      <aside class="sidebar">
+        <section class="panel">
+          <h3>Карти в проєкті</h3>
+          <ul id="layer-list" class="layer-list"></ul>
+        </section>
+
+        <section class="panel" id="transform-panel">
+          <h3>Перетворення</h3>
+          <select id="transform-select"></select>
+          <p class="muted small" id="transform-desc"></p>
+          <div id="fit-status" class="fit-status"></div>
+        </section>
+
+        <section class="panel grow">
+          <h3>
+            Контрольні точки
+            <span class="muted small" id="point-count"></span>
+          </h3>
+          <div class="table-wrap">
+            <table class="points">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th title="Використовувати в розрахунку">✓</th>
+                  <th>Зобр. (px)</th>
+                  <th>Карта (lat, lng)</th>
+                  <th title="Нев'язка — наскільки точка відхиляється від моделі">Похибка</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="points-body"></tbody>
+            </table>
+          </div>
+        </section>
+      </aside>
+
+      <section class="pane">
+        <div class="pane-toolbar">
+          <div class="segmented" id="mode-switch">
+            <button data-mode="points" title="Ставити контрольні точки (A)">⊕ Точки</button>
+            <button data-mode="clip" title="Обрізати — вибрати частину карти полігоном (C)">✂ Обрізка</button>
+            <button data-mode="pan" title="Тільки переглядати (V)">✋ Огляд</button>
+          </div>
+          <button class="btn small" id="clip-clear" title="Скинути обрізку">Скинути обрізку</button>
+          <div class="spacer"></div>
+          <button class="btn small icon" id="img-zoom-out" title="Зменшити">−</button>
+          <button class="btn small icon" id="img-zoom-in" title="Збільшити">+</button>
+          <button class="btn small" id="img-fit" title="Показати все зображення">Вмістити</button>
+        </div>
+        <div class="pane-body" id="image-view">
+          <div class="empty" id="image-empty">
+            <div class="empty-icon">🗺️</div>
+            <p><b>Перетягніть сюди скан або фото старої карти</b></p>
+            <p class="muted">або натисніть «+ Додати карту». JPG, PNG, WebP…</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="pane">
+        <div class="pane-toolbar">
+          <select id="basemap-select" title="Підкладка"></select>
+          <form id="search-form" class="search">
+            <input id="search-input" type="search" placeholder="Знайти місце…" />
+          </form>
+          <div class="spacer"></div>
+          <label class="opacity" title="Прозорість накладеної карти ([ і ])">
+            <span>◐</span>
+            <input type="range" id="overlay-opacity" min="0" max="1" step="0.05" />
+          </label>
+          <button class="btn small" id="overlay-toggle" title="Показати / сховати накладену карту (O)">👁</button>
+          <button class="btn small" id="overlay-fit" title="Наблизити до накладеної карти">⤢</button>
+        </div>
+        <div class="pane-body" id="map"></div>
+      </section>
+    </main>
+
+    <div class="hintbar" id="hint"></div>
+    <div class="toast" id="toast"></div>
+
+    <dialog id="help-dialog">
+      <h2>Як геореференсити карту</h2>
+      <ol>
+        <li>Натисніть <b>«+ Додати карту»</b> або перетягніть файл зі сканом.</li>
+        <li>Знайдіть ту саму місцевість на правій карті (пошук, підкладка «Гібрид» / «Супутник»).</li>
+        <li>Режим <b>⊕ Точки</b>: клікніть характерне місце на зображенні (перехрестя, церква, міст, вигин річки), потім <b>те саме місце на карті</b>. Порядок може бути і зворотний.</li>
+        <li>Повторіть для 3–4 точок, розкиданих <b>по кутах</b> карти, а не в одному місці. Після 2 точок з'являється попередній перегляд.</li>
+        <li>Слідкуйте за <b>похибкою</b>: червоні лінії на карті показують, наскільки точка не вписується в модель. Точку можна перетягнути або вимкнути.</li>
+        <li>Для фото під кутом виберіть «Проєктивне», для сильно викривлених старих карт — «Поліном 2» або «Thin Plate Spline».</li>
+        <li>Режим <b>✂ Обрізка</b>: клікайте вершини, подвійний клік / Enter — завершити. На карту потрапить лише вибрана частина (без полів, легенди).</li>
+      </ol>
+      <h3>Клавіші</h3>
+      <p class="small">
+        <kbd>A</kbd> точки · <kbd>C</kbd> обрізка · <kbd>V</kbd> огляд · <kbd>Esc</kbd> скасувати ·
+        <kbd>Del</kbd> видалити вибрану точку · <kbd>O</kbd> показати/сховати накладку · <kbd>[</kbd> <kbd>]</kbd> прозорість
+      </p>
+      <p class="small muted">Проєкт автоматично зберігається в браузері. Для перенесення на інший комп'ютер — «Файл → Зберегти проєкт».</p>
+      <form method="dialog"><button class="btn primary">Зрозуміло</button></form>
+    </dialog>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
